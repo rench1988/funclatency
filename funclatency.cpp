@@ -1,3 +1,5 @@
+// 文件名: main.cpp
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -20,6 +22,21 @@ extern "C" {
 #include <bpf/libbpf.h>
 #include "funclatency.skel.h"
 }
+
+// ===== 【新增】共享的结构体定义 =====
+// 必须与eBPF C代码中的定义保持一致
+#define MAX_CALL_STACK_DEPTH 256
+
+struct call_info { 
+    __u64 start_ts; 
+    __u64 func_addr; 
+};
+
+struct per_thread_stack { 
+    int depth; 
+    struct call_info calls[MAX_CALL_STACK_DEPTH]; 
+};
+// ===== 结束新增 =====
 
 // Event struct matching the one in the eBPF C code
 struct Event {
@@ -85,6 +102,13 @@ public:
         if (!skel_) {
             throw std::runtime_error("Failed to open and load BPF skeleton");
         }
+        
+        // ===== 【新增】初始化辅助map =====
+        if (initializeStackInitMap() != 0) {
+            funclatency_bpf__destroy(skel_);
+            throw std::runtime_error("Failed to initialize helper map (stack_init_map)");
+        }
+        // ===== 结束新增 =====
 
         for (const auto& sym : symbols) {
             attachProbe(binary_path, sym.mangled_name);
@@ -123,6 +147,26 @@ private:
     ring_buffer* ring_buffer_ = nullptr;
     std::vector<bpf_link*> links_;
     
+    // ===== 【新增】初始化辅助map的方法 =====
+    int initializeStackInitMap() {
+        // 在用户空间栈上创建一个清零的结构体
+        const struct per_thread_stack initial_stack = {};
+        int map_fd = bpf_map__fd(skel_->maps.stack_init_map);
+        if (map_fd < 0) {
+            std::cerr << "Error: Failed to get fd for stack_init_map: " << strerror(errno) << std::endl;
+            return -1;
+        }
+        // 将这个清零的结构体作为“模板”推送到BPF map的第0个元素中
+        int key = 0;
+        int ret = bpf_map_update_elem(map_fd, &key, &initial_stack, BPF_ANY);
+        if (ret != 0) {
+             std::cerr << "Error: Failed to update stack_init_map: " << strerror(errno) << std::endl;
+             return -1;
+        }
+        std::cout << "Successfully initialized helper map for stack allocation." << std::endl;
+        return 0;
+    }
+
     void attachProbe(const std::string& binary_path, const std::string& mangled_name) {
         struct bpf_uprobe_opts uprobe_opts;
         memset(&uprobe_opts, 0, sizeof(uprobe_opts));
@@ -172,7 +216,7 @@ private:
     }
 };
 
-// --- REVISED: Config parser for the new format ---
+// --- Config parser (无修改) ---
 std::vector<SymbolToTrace> parse_config(const std::string& config_path) {
     std::vector<SymbolToTrace> symbols;
     std::ifstream config_file(config_path);
@@ -191,7 +235,6 @@ std::vector<SymbolToTrace> parse_config(const std::string& config_path) {
         SymbolToTrace sym;
         std::string addr_str;
         
-        // Read address, mangled_name, and the rest is demangled_name
         ss >> addr_str >> sym.mangled_name;
         std::getline(ss, sym.demangled_name);
         if (!sym.demangled_name.empty() && sym.demangled_name.front() == ' ') {
@@ -204,7 +247,7 @@ std::vector<SymbolToTrace> parse_config(const std::string& config_path) {
         }
         
         try {
-            sym.addr = std::stoull(addr_str, nullptr, 0); // 0 base autodetects 0x
+            sym.addr = std::stoull(addr_str, nullptr, 0);
         } catch(const std::exception& e) {
              std::cerr << "Warning: invalid address format in config file (line " << line_num << "): " << addr_str << std::endl;
              continue;
@@ -215,7 +258,7 @@ std::vector<SymbolToTrace> parse_config(const std::string& config_path) {
 }
 
 
-// --- REVISED: Main function for the new workflow ---
+// --- Main function (无修改) ---
 int main(int argc, char **argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " /path/to/binary /path/to/config_with_addr.txt" << std::endl;
@@ -229,24 +272,20 @@ int main(int argc, char **argv) {
     signal(SIGTERM, sigHandler);
     
     try {
-        // Step 1: Parse the config file with addresses
         auto symbols_to_trace = parse_config(config_path);
         if (symbols_to_trace.empty()) {
             std::cerr << "No valid function entries found in config file." << std::endl;
             return 1;
         }
 
-        // Step 2: Populate the global address-to-demangled-name map
         std::cout << "Functions to be traced:" << std::endl;
         for (const auto& sym : symbols_to_trace) {
             global_addr_to_name[sym.addr] = sym.demangled_name;
             std::cout << "  - " << sym.demangled_name << " (at 0x" << std::hex << sym.addr << std::dec << ")" << std::endl;
         }
         
-        // Step 3: Create the tracer
         FuncLatencyTracer tracer(symbols_to_trace, binary_path);
         
-        // Step 4: Run the main event loop
         tracer.run();
 
     } catch (const std::exception& e) {
